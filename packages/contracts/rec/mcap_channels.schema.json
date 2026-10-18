@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.anet-drone.dev/rec/1/mcap_channels.schema.json",
+  "title": "rec/mcap_channels.json meta-schema",
+  "description": "AWR-16 §13.3.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "schema": {
+      "const": "awr.rec.mcap_channels.v1"
+    },
+    "profile": {
+      "const": "awr"
+    },
+    "doc": {
+      "type": "string"
+    },
+    "writer": {
+      "type": "object"
+    },
+    "schemas": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "encoding": {
+            "enum": [
+              "awr-layout",
+              "jsonschema"
+            ]
+          },
+          "data": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "encoding",
+          "data"
+        ]
+      }
+    },
+    "channels": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "topic": {
+            "type": "string",
+            "pattern": "^/"
+          },
+          "schema": {
+            "type": "string"
+          },
+          "message_encoding": {
+            "enum": [
+              "awr-raw",
+              "awr-msgpack"
+            ]
+          },
+          "record_policy": {
+            "type": "string"
+          },
+          "backfill": {
+            "enum": [
+              "latest",
+              "keyframe+delta",
+              "none"
+            ]
+          },
+          "group": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "topic",
+          "schema",
+          "message_encoding",
+          "record_policy",
+          "backfill",
+          "group"
+        ]
+      }
+    },
+    "metadata": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "d3_channels": {
+      "type": "array",
+      "description": "D3 benchmark run recording channels (M27 §7.5.1, AWR-05 §12.3 #10). Written only by the M27 writer to raw.mcap or truth/run_<id>.mcap; the D2 recorder reads channels[] only.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "topic",
+          "schema",
+          "message_encoding",
+          "file",
+          "rate",
+          "layer"
+        ],
+        "properties": {
+          "topic": {
+            "type": "string",
+            "pattern": "^/"
+          },
+          "schema": {
+            "type": "string",
+            "minLength": 1
+          },
+          "message_encoding": {
+            "enum": [
+              "msgpack",
+              "json",
+              "protobuf",
+              "awr-raw",
+              "binary"
+            ]
+          },
+          "file": {
+            "enum": [
+              "raw",
+              "truth"
+            ],
+            "description": "truth channels only appear in truth/run_<id>.mcap (hidden/ for the test split), never in raw.mcap"
+          },
+          "rate": {
+            "type": "string"
+          },
+          "layer": {
+            "enum": [
+              "observation",
+              "run",
+              "truth"
+            ]
+          },
+          "rrd_entity": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Rerun entity path of the .rrd derivative; null = not derived"
+          }
+        }
+      }
+    }
+  },
+  "required": [
+    "schema",
+    "profile",
+    "schemas",
+    "channels"
+  ]
+}

@@ -1,0 +1,124 @@
+// queryOptions factories (M15-FR-038; AWR-17 §4.2): fetchers come from net/api.ts (M11).
+// R04 GET /api/worlds answers {items, next_cursor} with snake_case fields (AWR-17 §4.3.2; SK-B-to-M15 item 1); the
+// select maps them to the camelCase WorldListItem the World Hub and the WORLD panel read. TTFP is not part of the REST
+// contract: the last TTFP per world is a local record (awr.ui.ttfp.v1, written when a world reveals).
+import { queryOptions } from '@tanstack/react-query'
+import { apiGet } from '@/net/api'
+import { demoWorlds } from '@/lib/demo'
+import { qk } from './keys'
+
+export type WorldStatus = 'ready' | 'missing' | 'building' | 'stale' | 'failed' | 'invalid'
+export interface WorldListItem {
+  id: string
+  name?: string
+  nameZh?: string
+  status?: WorldStatus
+  stats?: { points?: number; nodes?: number; bytes?: number; roots?: number; maxHeightM?: number; ttfpMs?: number }
+  levelsPoints?: number[]
+  anchorKind?: 'geodetic' | 'synthetic'
+  georeferenced?: boolean
+  contentVersion?: string
+  scaleStatus?: string
+  firstScreen?: { points?: number; bytes?: number }
+  defaultScenarioId?: string | null
+  inUse?: boolean
+}
+
+/** wire item of R04 (snake_case) */
+export interface WorldWire {
+  id: string
+  name?: string
+  name_zh?: string
+  status?: string
+  content_version?: string
+  scale_status?: string
+  anchor_kind?: string
+  georeferenced?: boolean
+  points?: number
+  bytes?: number
+  roots?: number
+  octree_bytes?: number
+  node_count?: number
+  levels_points?: number[]
+  max_height_m?: number
+  first_screen?: { points?: number; bytes?: number }
+  default_scenario_id?: string | null
+  in_use?: boolean
+}
+
+const STATUSES: readonly WorldStatus[] = ['ready', 'missing', 'building', 'stale', 'failed', 'invalid']
+const TTFP_KEY = 'awr.ui.ttfp.v1'
+function localTtfp(): Record<string, number> {
+  try {
+    const raw = globalThis.localStorage?.getItem(TTFP_KEY)
+    const v = raw ? (JSON.parse(raw) as unknown) : null
+    return v && typeof v === 'object' ? (v as Record<string, number>) : {}
+  } catch {
+    return {}
+  }
+}
+/** remember the TTFP of a world on this browser (World Hub "last TTFP") */
+export function recordTtfp(worldId: string, ms: number): void {
+  if (!Number.isFinite(ms) || ms <= 0) return
+  try {
+    const all = localTtfp()
+    all[worldId] = Math.round(ms)
+    globalThis.localStorage?.setItem(TTFP_KEY, JSON.stringify(all))
+  } catch {
+    // storage unavailable: nothing to remember
+  }
+}
+
+/** snake_case wire item -> view item (pure; exported for tests) */
+export function mapWorld(w: WorldWire, ttfp: Record<string, number> = {}): WorldListItem {
+  const status = STATUSES.includes(w.status as WorldStatus) ? (w.status as WorldStatus) : undefined
+  const anchor = w.anchor_kind === 'geodetic' || w.anchor_kind === 'synthetic' ? w.anchor_kind : undefined
+  return {
+    id: w.id, name: w.name, nameZh: w.name_zh, status, contentVersion: w.content_version, scaleStatus: w.scale_status,
+    anchorKind: anchor, georeferenced: w.georeferenced, levelsPoints: Array.isArray(w.levels_points) ? w.levels_points : undefined,
+    stats: { points: w.points, nodes: w.node_count, bytes: w.bytes, roots: w.roots, maxHeightM: w.max_height_m, ttfpMs: ttfp[w.id] },
+    firstScreen: w.first_screen, defaultScenarioId: w.default_scenario_id ?? null, inUse: w.in_use,
+  }
+}
+
+export function mapWorldList(d: { items?: WorldWire[] } | WorldWire[] | { worlds?: WorldWire[] }): WorldListItem[] {
+  const list = Array.isArray(d) ? d : ('items' in d && Array.isArray(d.items) ? d.items : 'worlds' in d && Array.isArray(d.worlds) ? d.worlds : [])
+  const ttfp = localTtfp()
+  return list.filter((w) => w && typeof w.id === 'string').map((w) => mapWorld(w, ttfp))
+}
+
+export const worldsQuery = () =>
+  queryOptions({
+    queryKey: qk.worlds(),
+    queryFn: ({ signal }) => apiGet<{ items?: WorldWire[]; next_cursor?: string | null }>('/api/worlds?limit=100', { signal }),
+    // the public demo build lists only the demo world even if a server lists more (ADR-083; the server filters as well)
+    select: (d: { items?: WorldWire[] }) => demoWorlds(mapWorldList(d)),
+  })
+
+/** world.json `dataset` block (AWR-16; M16-FR-006 / FR-010 data source and citation shown in the WORLD group and About) */
+export interface WorldDataset {
+  name?: string; version?: string; url?: string; citation?: string; license?: string; redistribution?: boolean
+  /** deployment terms (ADR-109 rule 3: "used under authorization of the dataset rights holders"); absent before ADR-109 */
+  terms?: string
+  /** engine of a reconstructed world (world.json generator.params.recon.engine; "mock" is simulated data, M01-to-M15 item 2) */
+  reconEngine?: string | null
+  tags?: string[]
+  /** D2: world.json stats and names (the World panel of the D2 surfaces, which do not read the D1 world list) */
+  stats?: { points?: number; areaKm2?: number; maxHeightM?: number } | null
+  nameZh?: string | null
+}
+export const worldDatasetQuery = (id: string) =>
+  queryOptions({
+    queryKey: qk.worldDataset(id),
+    staleTime: 600_000,
+    retry: false,
+    queryFn: async ({ signal }): Promise<WorldDataset | null> => {
+      // world.json is the content-version authority (AWR-17 §5.1 no-cache): revalidate like every other reader
+      const r = await fetch(`/worlds/${encodeURIComponent(id)}/world.json`, { signal, cache: 'no-cache', headers: { accept: 'application/json' } })
+      if (!r.ok || !(r.headers.get('content-type') ?? '').includes('json')) return null
+      const w = (await r.json()) as { dataset?: WorldDataset; tags?: unknown; generator?: { params?: { recon?: { engine?: unknown } } }; stats?: WorldDataset['stats']; nameZh?: unknown }
+      const engine = w.generator?.params?.recon?.engine
+      return { ...(w.dataset ?? {}), reconEngine: typeof engine === 'string' ? engine : null, tags: Array.isArray(w.tags) ? w.tags.filter((x): x is string => typeof x === 'string') : [],
+        stats: w.stats && typeof w.stats === 'object' ? w.stats : null, nameZh: typeof w.nameZh === 'string' ? w.nameZh : null }
+    },
+  })

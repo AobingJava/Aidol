@@ -1,0 +1,233 @@
+# configs/runtime.yaml（所有者 M11；运维语义见 AWR-19 §6.2，架构键见 AWR-10 §8.4）
+# 加载与校验：awr.runtime.config（未知键、类型错误、lan 模式缺 origins、profile = field、D1 中 real_ops.enabled = true
+# 一律以退出码 2 失败并指出键路径）。优先级：命令行 > AWR_* 环境变量 > profiles.<profile> > 本文件基础值 > 内置默认。
+# 生效配置写入 runs/<run>/effective-config.yaml（secret、admin_secret、token、*_key 掩码为 ***）。
+# 进程清单为 procs: 列表，各模块追加自己的条目（AWR-03 §4.3）；时长均为墙钟秒（ADR-045）。
+version: 1
+run:
+  id: auto                      # r<YYYYMMDD>-<HHMMSS>-<4hex>
+  world: shenzhen               # AWR_WORLD
+  scenario: s1-shenzhen-facade  # AWR_SCENARIO（剧本 id，scenarios/catalog.json）
+  fallback_world: synthcity     # 默认世界回退（ADR-077）：world 未显式指定且未构建、本世界已构建时改用它，剧本取 catalog 中它的 default；null 关闭
+  scenario_profile: null        # AWR_SCENARIO_PROFILE（剧本 profile，例如 ci、demo、n1000；M16）
+  shm_root: /dev/shm/awr        # 实际目录 ${shm_root}/${run.id}
+  persist_root: runs            # AWR_RUNS_DIR；实际目录 ${persist_root}/${run.id}
+  keep_run_dir: false           # AWR_KEEP_RUN_DIR；true 时停机不删 tmpfs 目录（ci 默认 true）
+  resume_after_crash: play      # play | pause（D1-ext checkpoint 恢复后的时钟状态，g05 §7.4）
+net:
+  bind: 127.0.0.1               # AWR_BIND
+  port: 8000                    # AWR_PORT
+  port_offset: 0                # AWR_PORT_OFFSET（0–31，ADR-055），8000、7447、5173、4173、8001 统一加 10·k
+  static_port: 8001             # AWR_STATIC_PORT；只在静态拆分回退启用时监听（10 AD-07）
+  access_mode: auto             # AWR_ACCESS_MODE：auto | loopback | lan | public（公开演示站，ADR-082）
+  origins: []                   # AWR_ORIGINS（逗号分隔）；回环 Origin 永远放行（public 模式除外：只认此处列出的）
+  allowed_hosts: []             # AWR_ALLOWED_HOSTS；空时由 origins 推导并加 localhost、127.0.0.1
+  trusted_proxies: []           # AWR_TRUSTED_PROXIES：可信反向代理（IP/CIDR），只用于限流与日志的客户端地址（X-Forwarded-For）
+  worlds_allow: []              # AWR_WORLDS_ALLOW：世界白名单，空表示不限制；其余世界的 REST 与静态请求 404
+  ws_max: 32                    # AWR_WS_MAX：WS 连接总数上限（17 §3.4）
+  ws_max_per_ip: null           # AWR_WS_MAX_PER_IP：每个客户端地址的 WS 连接上限（null 不限制）
+bus:
+  rendezvous: tcp/127.0.0.1:7447    # 端口随 port_offset 平移；主机部分不可改（只允许回环）
+  shm: false                        # zenoh SHM 一律关闭（g05 §0 第 9 条）
+  lease_ms: 3000
+quota:
+  runs_gb: 20                   # AWR_RUNS_QUOTA_GB
+  check_every_s: 600
+  disk_warn_gb: 10
+  disk_min_gb: 5
+cpu:
+  pin: auto                     # AWR_CPU_PIN：auto（≥ 8 核且 profile ≠ ci 时启用）| on | off
+defaults:
+  env: {OMP_NUM_THREADS: "1", OPENBLAS_NUM_THREADS: "1", MKL_NUM_THREADS: "1", PYTHONUNBUFFERED: "1"}
+  restart: {policy: always, backoff_s: [0.1, 1, 2, 4, 8], max: {count: 5, window_s: 60}}   # 首档 0.1 s（ADR-061）；窗口内第 6 次重启熔断（19 §4.2）
+  standby: true                 # 热备用总开关（false 时忽略 procs[].standby；public profile 关闭以省内存，ADR-082）
+  stop: {signal: SIGTERM, grace_s: 5}
+  log: {max_mb: 10, backups: 5, tail_lines: 200}
+real_ops:
+  enabled: false                # D1 恒为 false（OPS-FR-032）
+# D2 沙盒（AWR-04 §4.4.3、ADR-089 至 ADR-093；M17 PRD §6.7、§8.1；M11-FR-217）。键与缺省值以 M17 PRD §6.7 为准，这里只列
+# 部署常改的键，其余取 awr.runtime.config.SandboxCfg 的内置缺省（未知键以退出码 2 拒绝）。sandbox 层进程只在 profile 的
+# procs_enable 含 sandbox 时启动；enabled = false 时池运行但不接受创建（M17 PRD §8.5）。
+sandbox:
+  enabled: false                # AWR_SANDBOX_ENABLED
+  quota_profile: local          # local：无前缀配额与工作量证明、batch 开放；public：AWR-04 §11.5 全部生效
+  port: 8002                    # AWR_SANDBOX_PORT；随 net.port_offset 平移 10·k（public 18641）
+  state_dir: var/sandbox        # AWR_SANDBOX_STATE_DIR（相对仓库根或绝对路径）：token.key、pool.secret、state.json、runs/<sid>/
+  world_costs: configs/sandbox/world_costs.json   # 世界成本表（M16 harness 生成，M17 消费）
+  worlds_allow: []              # 空表示沿用 net.worlds_allow（再空则不限制）
+  max_sessions: auto            # AWR_SANDBOX_MAX_SESSIONS：auto 按 AWR-04 §4.4.1 公式（Q = 2.5 时 4、2.0 时 2），硬上限 6
+  cpu_quota_cores: 2.0          # 读不到单元根 cpu.max 时的 Q（systemd CPUQuota，Q-D2-01）
+  mem_sandbox_mb: 1100          # sandbox 组 memory.high − 控制面（AWR-04 §4.4.2；MemoryHigh 1.6G 时 950）
+  limits: {vehicles: 12, targets: 30, nests: 4, active_tasks: 6, cloned_models: 8, snapshot_kib: 512}
+  lifetime: {initial_s: 1800, renew_step_s: 1800, max_s: 7200}
+  idle: {enter_s: 60, ttl_s: 600}
+  queue: {max: 20, per_prefix: 1, offer_claim_s: 60, ticket_idle_s: 120, long_poll_s: 25}
+  ws: {max: auto, per_prefix: 4, per_session: 4}   # auto = 4·N_max（M11-FR-210）
+  rest: {rps: 10, burst: 30, call_rps: 20, call_burst: 40, clock_rps: 2, entity_rps: 5, task_rps: 1, setpoint_hz: 50}
+  event_ring: 8192              # 每会话 SessionContext 的 EventRing（D1 共享展示 65 536）
+  batch: {enabled: false}       # 批处理端点（P1）：本机与局域网可开，公开站 404
+  prewarm: 0                    # 预热 sim-core（P1）
+  # D2.1 驻留与内部档（AWR-04 §15.6.2、§15.7.4、§15.9.3；M17 PRD §14.4）
+  park: {idle_disconnected_s: 120, idle_disconnected_busy_s: 60, retention_s: 3600, per_prefix: 2, total_max: 64, disk_mb: 512,
+         session_mb: 8, checkpoint_timeout_s: 5}   # AWR_SANDBOX_PARK_RETENTION_S
+  internal: {reserved_slots: 1, lifetime_max_s: 28800, max_per_identity: 2}
+# D2.1（AWR-04 §15.6.2、§15.7.2、§15.9.2；ADR-120、ADR-121、ADR-123；M11-FR-230）。时长为墙钟秒；前端以容量接口与 serverInfo.power
+# 下发的值为准。测试栈可用 AWR_POWER_JSON、AWR_VIEWER_SEATS_JSON、AWR_IDENTITY_JSON 逐键覆盖（与 awr.sandbox.config.raw_section 同一约定）
+power:
+  viewer_idle_s: 300            # AWR_POWER_VIEWER_IDLE_S：共享展示实时观看无交互阈值
+  viewer_idle_busy_s: 120       # 观看席位已满且观看排队非空时
+  sandbox_idle_s: 600           # AWR_POWER_SANDBOX_IDLE_S：沙盒无交互阈值（到期驻留）
+  sandbox_idle_busy_s: 300      # 沙盒队列非空时
+  hidden_s: 60                  # AWR_POWER_HIDDEN_S：页面隐藏阈值
+  warn_s: 30                    # AWR_POWER_WARN_S：进入节能前的倒计时
+  quiet_s: 60                   # 可见且无交互后降为 30 fps（不改变服务端）
+  grace_s: 90                   # 服务端兜底余量
+  presence_min_s: 15            # presence 上报下限
+  internal_idle_s: 3600         # operator、admin 与内部身份
+  reap: true                    # show-api 兜底回收（本机长时间基准与浸泡可 --set power.reap=false）
+viewer_seats:
+  max: auto                     # AWR_VIEWER_SEATS_MAX：实时观看席位 V_max；auto = net.ws_max（ws_max_show）
+  queue_max: 100                # AWR_VIEWER_QUEUE_MAX
+  reserve_s: 30                 # 轮到者的预留
+  per_prefix: 2                 # 每地址前缀的排队票
+  ticket_idle_s: 60             # 票无长轮询作废（519）
+  long_poll_s: 25
+identity:
+  token_ttl_s: 43200            # 身份令牌 12 h
+  delay_ms: 300                 # 固定时延（± jitter_ms）
+  jitter_ms: 25
+  rps: 0.5                      # 每地址前缀 0.5 次/s、突发 3
+  burst: 3
+  state_dir: var/identity       # AWR_IDENTITY_STATE_DIR：锁定表与撤销表（0700）；口令只经 AWR_ADMIN_SECRET_FILE（install.sh --admin-secret-file）
+  lockout: {prefix_fail: 5, window_s: 600, prefix_lock_s: 1800, agg_fail: 10, agg_lock_s: 1800, global_fail_h: 30, global_lock_s: 900}
+procs:
+  - name: sim-core
+    layer: core
+    cmd: [python, -m, awr.sim.runtime]
+    run_scoped: true            # run 切换时随旧 run 停止、随新 run 启动（10 AD-01）
+    plugins: [awr.environment.stage, awr.sim.safety, awr.sim.mission, awr.sim.sensors.plugin]   # 组合根（10 §3.3 规则 1；M13 入口为 .plugin，INT-1）
+    cpus: [1]
+    nice: -5                    # 需要 CAP_SYS_NICE，否则取 0 并告警
+    liveness: {ring: state.sim-core, stale_s: 2.0, startup_grace_s: 15}
+    id_range: [0, 1024]
+    standby: true               # 热备用进程：重启时直接接替（AWR-19 §4.2，ADR-070；D1-AC-11b 挂死 ≤ 4 s 恢复）
+    standby_cpus: [7]           # 等待期间钉在 plan-pool 所在的 core7（ADR-017），接替时改为 cpus
+    # 主循环以外的线程（zenoh I/O、checkpoint 写线程、输入日志、plan-pool 管理线程）只放 core7：放到"其余全部 CPU"时，
+    # 持有 GIL 的后台线程会在 api（core0）或 Chromium（core2–6）满载的核上被抢占，主循环醒来后等 GIL（ADR-073 第 6 条）。
+    # 主循环未钉核（ci profile）时不生效
+    env: {AWR_SIM_AUX_CPUS: "7"}
+  - name: api
+    layer: core
+    cmd: [uvicorn, awr.api.main:app, --host, "${net.bind}", --port, "${net.port_effective}",
+          --loop, uvloop, --ws, websockets, --workers, "1",
+          --ws-per-message-deflate, "false", --ws-max-size, "262144", --ws-max-queue, "32"]   # 17 §3.4、M11-FR-028：uvicorn 0.54.0 默认 True 与 16 MiB
+    run_scoped: false           # 跨 run 存活，重开 zenoh 会话（10 AD-09）
+    cpus: [0]
+    start_after: [sim-core]     # 只是顺序，不是硬依赖：api 必须容忍 sim-core 缺席
+    liveness: {heartbeat: hb.api, stale_s: 5.0, startup_grace_s: 15}
+  - name: recorder
+    layer: ext
+    cmd: [python, -m, awr.recorder]
+    run_scoped: true
+    liveness: {heartbeat: hb.recorder, stale_s: 5.0, startup_grace_s: 15}
+  - name: replay-worker
+    layer: ext
+    on_demand: true             # 由 api 经 sys/start{name, args{run, segment}} 启动、sys/stop 停止（M11-FR-079）
+    cmd: [python, -m, awr.recorder.replay]
+    run_scoped: true
+    cpus: [7]
+    restart: {policy: on-failure}
+    liveness: {heartbeat: hb.replay-worker, stale_s: 5.0, startup_grace_s: 15}
+  - name: agent-runtime
+    layer: ext
+    cmd: [python, -m, awr.agent.runtime]
+    run_scoped: true
+    start_after: [sim-core]     # M14 §9.1、19 §6.2（M14-to-M11 第 1 条，INT-1）
+    liveness: {heartbeat: hb.agent-runtime, stale_s: 5.0, startup_grace_s: 15}
+  - name: job-worker
+    layer: ext
+    cmd: [python, -m, awr.jobs.worker]
+    run_scoped: false
+    nice: 10
+    restart: {policy: on-failure}
+    liveness: {heartbeat: hb.job-worker, stale_s: 120, startup_grace_s: 30}
+  # D2 沙盒控制面（M17 PRD §8.1；ADR-089、ADR-092）：supervisor 按 D1 语义监管；启动时按 AWR_CGROUP 移入 sandbox/ctl/
+  # （AWR-04 §4.4.4，无委派时留在原组）；沙盒 sim-core 由 sandbox-pool 以 setsid 拉起（AWR_DETACHED），不在本清单
+  - name: sandbox-pool
+    layer: sandbox
+    cmd: [python, -m, awr.sandbox.pool]
+    run_scoped: false
+    env: {AWR_CGROUP: sandbox/ctl, MALLOC_ARENA_MAX: "2"}   # arena 上限：会话总线线程的 arena 碎片（D2-FX-R2，D2-AC-06/45）
+    stop: {grace_s: 12}
+    liveness: {heartbeat: hb.sandbox-pool, stale_s: 5.0, startup_grace_s: 30}
+  - name: sandbox-api
+    layer: sandbox
+    cmd: [uvicorn, awr.api.sandbox_main:app, --host, "${net.bind}", --port, "${sandbox.port_effective}",
+          --loop, uvloop, --ws, websockets, --workers, "1",
+          --ws-per-message-deflate, "false", --ws-max-size, "262144", --ws-max-queue, "32"]
+    run_scoped: false
+    start_after: [sandbox-pool]
+    env: {AWR_CGROUP: sandbox/ctl, MALLOC_ARENA_MAX: "2"}
+    liveness: {heartbeat: hb.sandbox-api, stale_s: 5.0, startup_grace_s: 15}
+  # D3（AWR-05 §12.3 扩展点 12；M27 §4.2 进程表、M22-FR-048）：只由 d3 profile 启用；dmax 上以 d3-* 容器部署（19 号文档 D3 增补），
+  # 本机 d3 profile 用于开发。入口模块随各工作包交付（bench_main 归 M27）；公开与缺省 profile 不包含这些进程
+  - name: bench-api
+    layer: d3
+    cmd: [python, -m, awr.api.bench_main]
+    run_scoped: false
+    liveness: {heartbeat: hb.bench-api, stale_s: 5.0, startup_grace_s: 30}
+  - name: bench-scheduler
+    layer: d3
+    cmd: [python, -m, awr.bench.sched]
+    run_scoped: false
+    start_after: [bench-api]
+    liveness: {heartbeat: hb.bench-scheduler, stale_s: 10.0, startup_grace_s: 30}
+  - name: geosvc
+    layer: d3
+    on_demand: true             # 每个活跃世界一个，由 bench-scheduler 经 sys/start{name, args{world}} 启动（M22-FR-048）
+    cmd: [python, -m, awr.world.mesh.geosvc]
+    run_scoped: false
+    restart: {policy: on-failure}
+    liveness: {heartbeat: hb.geosvc, stale_s: 10.0, startup_grace_s: 60}
+  - name: lab-gateway
+    layer: d3
+    cmd: [python, -m, awr.bench.rt_main]
+    run_scoped: false
+    start_after: [bench-api]
+    liveness: {heartbeat: hb.lab-gateway, stale_s: 5.0, startup_grace_s: 30}
+  - name: rerun-proxy
+    layer: d3
+    cmd: [python, -m, awr.bench.rerun_proxy]
+    run_scoped: false
+    restart: {policy: on-failure}
+    liveness: {heartbeat: hb.rerun-proxy, stale_s: 10.0, startup_grace_s: 30}
+  - name: vite
+    layer: dev
+    cmd: [npx, vite, --port, "${net.vite_port_effective}", --strictPort, --host, 127.0.0.1]
+    cwd: apps/web
+    restart: {policy: on-failure}
+    liveness: {mode: exit_only}
+profiles:
+  dev:   {procs_enable: [core, ext, dev]}
+  demo:  {procs_enable: [core, ext], run: {resume_after_crash: play}}
+  ci:    {procs_enable: [core, ext], cpu: {pin: "off"}, run: {keep_run_dir: true}, quota: {runs_gb: 5}, net: {port_offset: 9}}   # 功能门禁（G1）
+  perf:  {procs_enable: [core, ext], cpu: {pin: "on"}, run: {keep_run_dir: true}, quota: {runs_gb: 5}, net: {port_offset: 9}}    # 性能用例（18 PR-6 要求钉核）
+  # 公开演示站 v2（D2；AWR-19 §3.7，ADR-082/084/085 的 D1 口径加 ADR-089、ADR-091、ADR-094、ADR-109）：核心进程加沙盒控制面
+  # （recorder、agent-runtime、job-worker 关闭），共享展示运行剧本 S7（接力监控，public 剧本 profile），七个世界在共享展示可静态
+  # 浏览、在沙盒可创建与切换；show-api 只监听回环 18640、sandbox-api 18641，由 nginx 按 /api/sandbox/ 前缀分流；
+  # show-api 的 WS 上限 24（ws_max_show）、每地址前缀 4；AWR_ORIGINS（部署域名）必须由部署环境给出，缺省即以退出码 2 拒绝启动
+  public: {procs_enable: [core, sandbox], cpu: {pin: "off"}, defaults: {standby: false},
+           run: {world: synthcity, scenario: s7-synthcity-relay, scenario_profile: public, fallback_world: null},
+           net: {bind: 127.0.0.1, port: 18640, access_mode: public, trusted_proxies: [127.0.0.1, "::1"],
+                 worlds_allow: [synthcity, shenzhen, suzhou, newyork, chicago, shanghai, sanfrancisco],
+                 ws_max: 24, ws_max_per_ip: 4},
+           bus: {rendezvous: tcp/127.0.0.1:18647}, quota: {runs_gb: 2, disk_warn_gb: 2, disk_min_gb: 1},
+           sandbox: {enabled: true, quota_profile: public, port: 18641, state_dir: /opt/anet-drone4d/var/sandbox,
+                     worlds_allow: [synthcity, shenzhen, suzhou, newyork, chicago, shanghai, sanfrancisco],
+                     batch: {enabled: false}},
+           identity: {state_dir: /opt/anet-drone4d/var/identity}}   # install.sh 以 0700 awr 创建（D2.1）
+  # 本机沙盒（D2 开发与验收）：dev 进程加沙盒控制面，quota_profile local（无前缀配额与工作量证明），批处理开放
+  sandbox: {procs_enable: [core, ext, dev, sandbox], sandbox: {enabled: true, batch: {enabled: true}}}
+  # D3 开发（AWR-05 §12.3 扩展点 12）：dev 进程加 D3 进程，AWR_D3_ENABLED = 1（M04 扩展点 7 的网格分派开关）；公开与缺省 profile 不变
+  d3: {procs_enable: [core, ext, dev, d3], defaults: {env: {AWR_D3_ENABLED: "1"}}}
+  field: {}                     # V0.5 起定义；D1 中选择 field 即以退出码 2 拒绝

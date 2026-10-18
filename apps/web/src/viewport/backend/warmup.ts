@@ -1,0 +1,151 @@
+// Shader zoo warm-up (ADR-007; M06 §6.4, FR-009, AC-007/008; D1-AC-25). Owner: M06.
+// Collects warmupVariants(be) of every registered layer, makes each object drawable (before()), then renders the live
+// scene (so scene.fogNode, lights and output settings match run time) once per target the objects use: the default
+// framebuffer (hidden under the DOM mask) and each render target (cloud, pick, bench ...). With KHR_parallel_shader_compile
+// the scene is first handed to compileAsync (drivers compile in parallel; on SwiftShader ANGLE still links at first
+// draw, so the real renders are what removes the first-frame cost, g01 §4.3). Extra scenes (the P2 composite quad)
+// are rendered to their own target. Afterwards every object gets its live state back (after()).
+// On SwiftShader every target is rendered a second time through o.bare (each draw first in its own command buffer), so
+// both vertex-routine variants of every program are compiled here (attribSlots.ts; ADR-071 item 1).
+// Report: warmupMs (wall) and programs (renderer.info.programs.length) as the baseline of D1-AC-25.
+// Progress (D2.1 WP-11b; request d2-WP-12-to-M06 item 1; AWR-04 §15.5.2): o.progress(x) after the parallel compile (0.25),
+// after each target of the first pass (up to 0.75) and at the end (1): the boot mask's "warming" segment advances while
+// the zoo runs instead of jumping at the gate.
+// Targets in `once` (D2: the sensor view target, whose programs are the canvas ones) are rendered in the first pass only
+// and never through o.bare: a framebuffer format only adds SwiftShader pixel routines, the vertex-routine variants and the
+// buffer uploads are target-independent and already covered by the other targets, and rasterised into a 16 x 16 corner of
+// the target only (the routines are compiled per draw, not per pixel; keeps the zoo short, D2-AC-01).
+import { Vector4, type Camera, type Object3D, type RenderTarget, type Scene, type WebGLRenderTarget, type WebGLRenderer } from 'three'
+import type { WarmTarget, WarmupItem } from '../layers/registry'
+
+export interface WarmupReport { warmupMs: number; programs: number; items: number; targets: number }
+export interface ExtraPass { scene: Scene; camera: Camera; target: RenderTarget | null; before?(): void; after?(): void; once?: boolean }
+
+interface Saved { o: Object3D; parent: Object3D | null; visible: boolean; frustumCulled: boolean; mask: number }
+
+/** true when a is a proper ancestor of b */
+function isAncestor(a: Object3D, b: Object3D): boolean {
+  for (let p = b.parent; p; p = p.parent) if (p === a) return true
+  return false
+}
+
+const SMALL_PX = 16
+/** a once-target is rasterised into its SMALL_PX corner only; returns the viewport to restore */
+function shrink(t: RenderTarget): Vector4 {
+  const saved = t.viewport.clone()
+  t.viewport.set(0, 0, Math.min(SMALL_PX, t.width), Math.min(SMALL_PX, t.height))
+  return saved
+}
+
+export async function warmupZoo(r: WebGLRenderer, scene: Scene, camera: Camera, items: readonly WarmupItem[],
+  targetOf: (t: WarmTarget) => RenderTarget | null | undefined,
+  o: { parallelCompile: boolean; extra?: readonly ExtraPass[]; programs: () => number; bare?: (fn: () => void) => void; sync?: boolean; once?: ReadonlySet<WarmTarget>
+    progress?: (x: number) => void }): Promise<WarmupReport> {
+  const t0 = performance.now()
+  const saved: Saved[] = []
+  const itemMask = items.map((it) => it.object.layers.mask)
+  const seen = new Set<Object3D>()
+  // make every item drawable (instance count >= 1, visible, not culled, ancestors visible); called again right before
+  // the renders: the loop keeps running while compileAsync is awaited (seconds on SwiftShader) and its per-frame tasks
+  // hide the batches again (a trail batch without vehicles, frustums without a selection), which the renders then
+  // skipped, so their buffers were uploaded and their draw states compiled only at the first use after the reveal
+  // (P4-WEB, ADR-071 item 2)
+  const prepare = (): void => {
+    for (const it of items) {
+      const obj = it.object
+      if (!seen.has(obj)) {
+        seen.add(obj)
+        saved.push({ o: obj, parent: obj.parent, visible: obj.visible, frustumCulled: obj.frustumCulled, mask: obj.layers.mask })
+      }
+      it.before?.()
+      if (!obj.parent) scene.add(obj)
+      obj.visible = true
+      obj.frustumCulled = false
+      // hidden ancestors (an invisible layer root) would hide the object: force them visible for the warm-up
+      for (let a = obj.parent; a && a !== scene; a = a.parent) {
+        if (a.visible) continue
+        if (!seen.has(a)) {
+          seen.add(a)
+          saved.push({ o: a, parent: a.parent, visible: false, frustumCulled: a.frustumCulled, mask: a.layers.mask })
+        }
+        a.visible = true
+      }
+    }
+  }
+  prepare()
+  const mask = camera.layers.mask
+  camera.layers.enableAll()
+  const prevTarget = r.getRenderTarget()
+  const autoClear = r.autoClear
+  const wanted = new Set<WarmTarget>()
+  for (const it of items) for (const t of it.targets ?? ['screen']) wanted.add(t)
+  try {
+    if (o.parallelCompile && typeof (r as unknown as { compileAsync?: unknown }).compileAsync === 'function') {
+      try {
+        await r.compileAsync(scene, camera)
+      } catch {
+        /* compileAsync is an optimisation only */
+      }
+      prepare()
+    }
+    o.progress?.(0.25)
+    const renderAll = (bare: boolean): void => {
+      let done = 0
+      for (const t of wanted) {
+        if (bare) o.progress?.(0.25 + (0.5 * done++) / Math.max(1, wanted.size))
+        const once = o.once?.has(t) === true
+        if (once && !bare) continue
+        const target = t === 'screen' ? null : targetOf(t)
+        if (target === undefined) continue
+        // only the objects that use this target draw; an item that is an ancestor of one that does (the point-pick object
+        // is a child of the point-cloud root) stays visible with an empty layer mask, so three still descends into it
+        // without drawing it (otherwise the child's program would first compile at run time, FX-WEB1)
+        for (let i = 0; i < items.length; i++) {
+          const uses = (items[i].targets ?? ['screen']).includes(t)
+          const holder = !uses && items.some((it, k) => k !== i && (it.targets ?? ['screen']).includes(t) && isAncestor(items[i].object, it.object))
+          items[i].object.visible = uses || holder
+          items[i].object.layers.mask = holder ? 0 : itemMask[i]
+        }
+        r.setRenderTarget(target as WebGLRenderTarget | null)
+        r.autoClear = true
+        const small = once && target ? shrink(target) : null
+        r.render(scene, camera)
+        if (small) target!.viewport.copy(small)
+        // SwiftShader: the same draws once more, each as the first draw of a fresh submission (the second vertex
+        // routine variant, viewport/backend/attribSlots.ts; P4-WEB, ADR-071 item 1)
+        if (bare && !once) o.bare?.(() => r.render(scene, camera))
+      }
+      for (const x of o.extra ?? []) {
+        if (x.once && !bare) continue
+        x.before?.()
+        r.setRenderTarget(x.target as WebGLRenderTarget | null)
+        r.render(x.scene, x.camera)
+        if (bare && !x.once) o.bare?.(() => r.render(x.scene, x.camera))
+        x.after?.()
+      }
+    }
+    renderAll(true)
+    if (!o.sync) {
+      // three's WebGLNodesHandler disposes an object's geometry in a microtask right after building its node material
+      // (updateGeometryAttributes), so the buffers and vertex arrays of the first render are gone again: one more
+      // render after the microtasks uploads them for good. Without it a batch first drawn after the reveal (the
+      // selected trail and its halo, frustums, the goto marker) re-allocated its buffers there (P4-WEB, ADR-071 item 2)
+      await new Promise((ok) => setTimeout(ok, 0))
+      prepare()
+      renderAll(false)
+    }
+    o.progress?.(1)
+  } finally {
+    r.setRenderTarget(prevTarget)
+    r.autoClear = autoClear
+    camera.layers.mask = mask
+    for (const s of saved) {
+      if (!s.parent && s.o.parent === scene) scene.remove(s.o)
+      s.o.visible = s.visible
+      s.o.frustumCulled = s.frustumCulled
+      s.o.layers.mask = s.mask
+    }
+    for (const it of items) it.after?.()
+  }
+  return { warmupMs: performance.now() - t0, programs: o.programs(), items: items.length, targets: wanted.size }
+}
