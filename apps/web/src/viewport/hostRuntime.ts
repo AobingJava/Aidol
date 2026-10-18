@@ -1,0 +1,417 @@
+// Viewport host runtime (M06 §6.2.4, §6.5, §6.6, §6.14, §6.17; FR-009, FR-010, FR-016..018, FR-022, FR-069..072). Owner: M06.
+// Non-React side of WorldCanvas: attaches the backend to the live scene, installs the camera rig and the picker,
+// registers the frame tasks (camera phase: FrameCtx canvas fields, cloud scale with motion degradation, camera update;
+// render phase: pass plan + RenderBackend.renderFrame + per-layer draw counts; governor phase: PerfGovernor 1 Hz and the
+// start-rung memory), runs self test and shader zoo under the mask (gate 'warmup'), and handles device loss (layers
+// release GPU resources, 250 ms later the canvas is remounted and the backend re-created; 3 losses within 60 s are
+// fatal, M06-E003).
+// D2.1 (WP-11b; AWR-04 §15.7.7, §15.8.6): the quality profile's frame-rate limit (phone 30 fps; tablet 30 fps once the
+// PerfGovernor stepped down) and frame-time target, its EDL rule (phone off, tablet while undegraded), and the power-save
+// interplay: a canvas resize while the loop is suspended renders one frame (LoopDriver), input on the canvas in static
+// browsing wakes the loop for 2 s (viewport.setWakeOnInput).
+import type { PerspectiveCamera, Scene } from 'three'
+import {
+  CameraRig, ctx as frameCtx, events, governor, loop, perf, perfProbe, Picker, refreshMs, register, setSoftware, onRefreshChange, type CameraPose, type FrameCtx,
+} from '@/engine'
+import { INJECT } from '@/engine'
+import { boot } from '@/app/boot/BootController'
+import { rtClient } from '@/net/rt'
+import type { ClientStats } from '@/net/rt/types'
+import { perfStore, type MotionCap } from '@/stores/perf'
+import { listLayers, onLayersChanged, pointCloudServices, type LayerId, type WarmupItem } from './layers/registry'
+import { newPassPlan, type RenderBackend } from './renderer'
+import { vp } from './session'
+import { installQualityMasks } from './qualityMask'
+import { installBench, pcOnlyScene } from './bench'
+import { installAnimationSampler } from './animationSampler'
+import { makePointPick } from './pickPass'
+import { TEST_SWITCHES } from '@/lib/testSwitches'
+import { parseInject } from './backend/testSwitches'
+import { readCache, rememberFloorHeld, PREF_FLOOR_MS } from './backend/deviceClass'
+import { installSensorViewCamera, sensorViewActive } from './sensorView/state'
+import { drawsIn, sensorClassOf } from './sensorView/pass'
+import { sv } from './sensorView/state'
+import { qualityEdlNow, qualityFpsNow } from './quality'
+import { reportWarmPart } from '@/lib/bootProgress'
+
+/** frame-time target (ms) of the backend: software 33.3, else the display refresh, never below the profile's frame-rate limit */
+export function targetMsOf(be: Pick<RenderBackend, 'deviceClass' | 'quality'>, refresh: number, governorStep = 0): number {
+  if (be.deviceClass === 'software') return 33.3
+  const fps = qualityFpsNow(be.quality, governorStep)
+  return fps > 0 ? Math.max(refresh, 1000 / fps) : refresh
+}
+
+export const HOST = { lostDelayMs: 250, lostWindowMs: 60_000, lostMax: 3, motionFactor: 0.75, motionRestoreMs: 200, motionRadS: 0.5, motionLinFrac: 0.5 } as const
+
+const lostTimes: number[] = []
+let rebuildCb: (() => void) | null = null
+/** camera pose kept across a rebuild (device loss, viewport.rebuild()): the remounted rig resumes it (M05 request 7) */
+let poseAcrossRebuild: CameraPose | null = null
+/** WorldCanvas installs the remount callback (key bump) */
+export function onRebuildRequest(cb: (() => void) | null): void {
+  rebuildCb = cb
+}
+
+/** viewport.rebuild() and device loss: release GPU state of every layer, then remount the canvas after 250 ms */
+export function requestRebuild(reason: string): Promise<void> {
+  const now = performance.now()
+  while (lostTimes.length && now - lostTimes[0] > HOST.lostWindowMs) lostTimes.shift()
+  lostTimes.push(now)
+  for (const s of listLayers()) s.onBackendLost?.()
+  if (lostTimes.length >= HOST.lostMax && reason !== 'user') {
+    console.error('M06-E003 the render backend was lost 3 times within 60 s')
+    if (vp.be) vp.be.state = 'FAILED'
+    perfStore.setState({ backendState: 'FAILED' })
+    events.emit('backend.state', { state: 'FAILED', code: 'M06-E003' })
+    return Promise.resolve()
+  }
+  perfStore.setState({ backendState: 'LOST' })
+  events.emit('backend.state', { state: 'LOST', code: 'M06-E002' })
+  if (vp.rig && vp.rig.mode !== 'fpv' && vp.rig.mode !== 'third') poseAcrossRebuild = vp.rig.getPose()
+  return new Promise((ok) => setTimeout(() => {
+    rebuildCb?.()
+    ok()
+  }, HOST.lostDelayMs))
+}
+
+/**
+ * shader-zoo items of every registered layer. flight60 scene=pc shows the point cloud alone for the page's lifetime
+ * (bindings/layersVisibility.ts hides every other layer), so only its items are warmed there: the other layers' programs
+ * would never draw, and compiling them took most of the 1.3 s zoo of the canvas-only cold start (FX2-R2, D1-AC-02)
+ */
+export function collectZoo(only?: ReadonlySet<LayerId>): WarmupItem[] {
+  const out: WarmupItem[] = []
+  const be = vp.be
+  if (!be) return out
+  const pcOnly = pcOnlyScene()
+  for (const s of listLayers()) {
+    if (pcOnly && s.id !== 'pointcloud') continue
+    if (only && !only.has(s.id)) continue
+    try {
+      out.push(...(s.warmupVariants?.(be) ?? []))
+    } catch (e) {
+      console.warn(`warm-up variants of ${s.id} failed`, e)
+    }
+  }
+  return out
+}
+
+/** layers whose warm-up variants the zoo rendered (late registrations are warmed by installLateWarm) */
+const warmedLayers = new Set<LayerId>()
+
+/** resolves once no layer registered for `quietMs` (rAF clock), at most `maxMs` after the call */
+function layersQuiet(quietMs = 120, maxMs = 1500): Promise<void> {
+  return new Promise((ok) => {
+    const t0 = performance.now()
+    let last = t0
+    const off = onLayersChanged(() => {
+      last = performance.now()
+    })
+    const tick = (): void => {
+      const now = performance.now()
+      if (now - last >= quietMs || now - t0 >= maxMs) {
+        off()
+        ok()
+      } else requestAnimationFrame(tick)
+    }
+    requestAnimationFrame(tick)
+  })
+}
+
+/**
+ * self test + shader zoo under the mask; resolves the 'warmup' boot gate. The self test draws at once and its two
+ * asynchronous read-backs are awaited after the zoo, not before it: the read-back polling waits for free main-thread
+ * slots, which the UI shell takes while it mounts (2.5 s of the cold start in scene=full, FX2-R2). Its result only
+ * reports (M06-E004/E005, pointSizeDegraded); the point materials are built before it in every case.
+ */
+export async function warmupBackend(be: RenderBackend, camera: PerspectiveCamera): Promise<void> {
+  const p = perfProbe()
+  try {
+    p.mark('boot.selftest') // startup timeline marks (once per page; __perf.marks, AWR-18 §9.2)
+    const stP = be.selftest()
+    await new Promise((ok) => requestAnimationFrame(() => ok(null)))
+    // the M05 EDL composite must be the P2 material the zoo warms (Tier B/A), even if no frame ran yet
+    if (be.tier !== 'S') be.setEdl(pointCloudServices()?.edlMaterial ?? null)
+    // the layers that need the drone runtime (trails, glyphs, sensors, mission) register one commit after it exists:
+    // wait until the set is quiet, so their batches (selected trail and halo, frustums, goto marker...) are rendered,
+    // their buffers uploaded and their draw states compiled under the mask too (P4-WEB, ADR-071 item 2)
+    await layersQuiet()
+    p.mark('boot.zoo')
+    warmedLayers.clear()
+    for (const l of listLayers()) warmedLayers.add(l.id)
+    // the boot mask's warming segment follows the zoo (d2-WP-12-to-M06 item 1; AWR-04 §15.5.2)
+    const rep = await be.warmup(camera, collectZoo(), { progress: (x) => reportWarmPart('shaders', x) })
+    p.mark('boot.warm')
+    p.meta.warmupMs = rep.warmupMs
+    const st = await stP
+    if (!st.pointSizeOk) perfStore.setState({ pointSizeDegraded: true })
+  } catch (e) {
+    console.error('shader zoo warm-up failed', e)
+  }
+  if (be.state === 'WARMING') be.state = 'READY'
+  // after a rebuild (device loss, viewport.rebuild) the page is already revealed: the new renderer's warmed program
+  // count is the new baseline of "no program after the reveal" (M06-FR-010, NFR-004)
+  if (perf.revealed) p.gpu.programsAtReveal = be.programsCount()
+  p.meta.backendState = be.state
+  perfStore.setState({ backendState: be.state })
+  events.emit('backend.state', { state: be.state, tier: be.tier, deviceClass: be.deviceClass })
+  boot.resolveGate('warmup')
+}
+
+/**
+ * AWR-17 §6.3 clientStats for the gateway (M11 request 5), governor phase at 1 Hz, one preallocated object: frame p50 and
+ * p95 of the perf summary, heap (Chrome performance.memory), frames over 1.5 x the target since the last report, the
+ * CAS point budget, the focus latency p95 and the global delay. Returns the new ring position.
+ */
+function reportClientStats(out: ClientStats, from: number): number {
+  const rt = rtClient()
+  const p = perfProbe()
+  const r = p.frame.interval
+  const cap = r.buf.length
+  const lim = 1.5 * (p.meta.targetMs > 0 ? p.meta.targetMs : 16.7)
+  let dropped = 0
+  for (let i = Math.max(from, r.n - cap); i < r.n; i++) if (r.buf[i & (cap - 1)] > lim) dropped++
+  if (!rt) return r.n
+  const sum = perfStore.getState()
+  const mem = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory
+  out.frameMs = Number.isFinite(sum.p50Ms) ? sum.p50Ms : 0
+  out.frameP95Ms = Number.isFinite(sum.p95Ms) ? sum.p95Ms : 0
+  out.heapMB = mem ? mem.usedJSHeapSize / 1048576 : 0
+  out.droppedFrames = dropped
+  out.pointBudget = sum.B
+  out.latencyP95Ms = Number.isFinite(sum.latencyP95Ms) ? sum.latencyP95Ms : 0
+  out.dGlobalMs = Number.isFinite(p.latency.dGlobalMs) ? p.latency.dGlobalMs : 0
+  rt.setClientStats(out)
+  return r.n
+}
+
+/** install the frame tasks of a mounted canvas; returns the uninstall function */
+export function installHost(be: RenderBackend, scene: Scene, camera: PerspectiveCamera, host: HTMLElement, canvas: HTMLCanvasElement): () => void {
+  const p = perfProbe()
+  vp.be = be
+  vp.scene = scene
+  vp.camera = camera
+  vp.host = host
+  be.attach(scene)
+  loop.setTier(be.tier, be.deviceClass)
+  setSoftware(be.deviceClass === 'software')
+  frameCtx.be = be
+  p.meta.tier = be.tier
+  p.meta.deviceClass = be.deviceClass
+  p.meta.renderer = be.info.rendererString
+  p.meta.adapterArch = be.info.adapterArch
+  p.meta.targetMs = targetMsOf(be, refreshMs())
+  loop.setQualityFps(qualityFpsNow(be.quality, 0))
+  // test switches only in dev/test builds (TEST_SWITCHES folds to false in production and drops the branch: M06-AC-010)
+  if (TEST_SWITCHES) {
+    const f = be.info.forced
+    p.forced = f ? { ...(f.tier ? { tier: f.tier } : {}), ...(f.perfInject ? { perfInject: f.perfInject } : {}) } : null
+    const inj = parseInject(f?.perfInject)
+    INJECT.busyMs = inj.busyMs
+    INJECT.renderBusyMs = inj.renderBusyMs
+  } else p.forced = null
+  perfStore.setState({ tier: be.tier, deviceClass: be.deviceClass, forced: be.info.forced !== null, targetMs: p.meta.targetMs, backendState: be.state })
+  const motionTier = (): 'full' | 'lite' | 'reduced' | 'off' => {
+    const m = typeof document !== 'undefined' ? document.documentElement.dataset.motion : 'full'
+    return m === 'lite' || m === 'reduced' || m === 'off' ? m : 'full'
+  }
+  const dtm = (x: number, y: number): number => vp.groundAt(x, y, pointCloudServices()?.dtm ? (a, b) => pointCloudServices()!.dtm!.sample(a, b) : null)
+  const rig = new CameraRig(camera, host, {
+    motionTier, dtm,
+    sensors: () => vp.sensors,
+    focusPose: (a, pos, q, vel) => vp.drones?.fullPoseOf(a, pos, q, vel) ?? false,
+    setFocus: (a) => {
+      vp.drones?.layer.setFocus(a, a >= 0 ? (rig.mode === 'fpv' ? 'fpv' : 'third') : 'none')
+      pointCloudServices()?.setFocus?.(null, a >= 0 ? (rig.mode === 'fpv' ? 'fpv' : 'follow') : 'none')
+      ;(vp.drones?.time.interp as unknown as { setFocus?: (a: number) => void } | undefined)?.setFocus?.(a)
+      perfStore.setState({ focusLowLatency: a >= 0 })
+    },
+    prefetch: (eye, target, fov) => pointCloudServices()?.prefetchView?.(eye, target, fov),
+    onMode: (mode, followLock) => {
+      vp.drones?.layer.setFocus(rig.focusAgent, mode === 'fpv' ? 'fpv' : mode === 'third' ? 'third' : 'none')
+      events.emit('camera.mode', { mode, followLock })
+    },
+    onMoved: (active) => events.emit('camera.moved', { active }),
+    onFlight: (phase, reason) => events.emit('camera.flight', { phase, reason }),
+  })
+  vp.rig = rig
+  if (poseAcrossRebuild) {
+    rig.setPose(poseAcrossRebuild, { fly: false })
+    poseAcrossRebuild = null
+  }
+  vp.picker = new Picker({
+    camera: () => vp.camera, size: () => ({ w: vp.cssW, h: vp.cssH }), poses: () => (vp.staticBrowse ? null : vp.drones?.poses ?? null),
+    idOf: (a) => rtClient()?.roster.idOf(a) ?? String(a), worldId: () => vp.worldId, moving: () => rig.moving,
+    pickPoint: makePointPick(be), // M06-FR-064 ID pass (FX-WEB1)
+  })
+  const plan = newPassPlan()
+  const focusP = new Float64Array(3)
+  let focusSent = false
+  let statsFrom = 0
+  const stats: ClientStats = { frameMs: 0, frameP95Ms: 0, heapMB: 0, droppedFrames: 0, pointBudget: 0, latencyP95Ms: 0, dGlobalMs: 0 }
+  let lastMoveMs = Number.NEGATIVE_INFINITY
+  let floorTotalMs = 0
+  let floorSaved = false
+  let qualityStep = 0
+  onRefreshChange((ms) => {
+    p.meta.targetMs = targetMsOf(be, ms, qualityStep)
+    if (be.deviceClass !== 'software') pointCloudServices()?.cas?.setTarget?.(p.meta.targetMs, p.meta.tailK)
+  })
+  const offs = [
+    register('camera', 'viewport.ctx', (ctx: FrameCtx) => {
+      ctx.camera = camera
+      ctx.cssW = vp.cssW
+      ctx.cssH = vp.cssH
+      ctx.dbW = canvas.width
+      ctx.dbH = canvas.height
+      ctx.dpr = vp.cssW > 0 ? canvas.width / vp.cssW : 1
+      rig.update(ctx)
+      ctx.moving = rig.moving
+      // Follow/FPV focus position (ENU) for the point-cloud selection (M05 services.setFocus); cleared once on leaving
+      const pcs = pointCloudServices()
+      const fm = rig.mode === 'fpv' ? 'fpv' : rig.mode === 'third' ? 'follow' : 'none'
+      if (fm !== 'none' && rig.focusAgent >= 0 && vp.drones?.poseOf(rig.focusAgent, focusP)) {
+        pcs?.setFocus?.(focusP, fm)
+        focusSent = true
+      } else if (focusSent) {
+        pcs?.setFocus?.(null, 'none')
+        focusSent = false
+      }
+      // Tier B/A cloud scale = rung rs x motion degradation (x 0.75 while moving, back after 200 ms still)
+      if (be.tier !== 'S') {
+        const st = pointCloudServices()?.cas?.state() as { rs?: number } | undefined
+        const rs = st?.rs ?? 1
+        if (rig.moving) lastMoveMs = ctx.nowMs
+        const motion = ctx.nowMs - lastMoveMs < HOST.motionRestoreMs ? HOST.motionFactor : 1
+        be.setCloudScale(rs * motion)
+      }
+      ctx.cloudScale = be.cloudScale
+      const m = p.meta
+      m.renderScale = be.tier === 'S' ? 0.5 : be.cloudScale
+      // AWR-18 §9.2 metadata (in place, no allocation): canvas CSS size, drawing buffer, raster/CSS ratio, world
+      m.canvasCss[0] = ctx.cssW
+      m.canvasCss[1] = ctx.cssH
+      m.drawingBuffer[0] = ctx.dbW
+      m.drawingBuffer[1] = ctx.dbH
+      m.dpr = ctx.dpr
+      if (vp.worldId !== null && m.worldId !== vp.worldId) m.worldId = vp.worldId
+      const cv = vp.world?.contentVersion
+      if (cv !== undefined && m.contentVersion !== cv) m.contentVersion = cv
+    }, { order: -100 }),
+    register('render', 'backend.render', (ctx: FrameCtx) => {
+      // M05 EDL composite for P2 once the point-cloud layer exposes it (Tier B/A); D2.1: the profile may switch it off
+      if (be.tier !== 'S') be.setEdl(qualityEdlNow(be.quality, qualityStep) ? pointCloudServices()?.edlMaterial ?? null : null)
+      be.plan(ctx, plan)
+      be.renderFrame(ctx, plan)
+      const svOn = plan.sensorDraws > 0
+      for (const s of listLayers()) {
+        const L = p.layers[s.perfKey]
+        if (!L) continue
+        const c = svOn ? sensorClassOf(s) : 'world'
+        L.draws = !svOn || s.id === 'pointcloud' || drawsIn(c, 'world', sv.mode) || drawsIn(c, 'overlay', sv.mode) ? s.drawCount(ctx) : 0
+      }
+    }),
+    // D2 sensor views: uniforms of the shown view after the drones and their frustums (world phase, camera final)
+    register('world', 'sensorView.update', (ctx: FrameCtx) => {
+      if (sensorViewActive()) be.sensor.update(ctx)
+    }, { order: 20 }),
+    register('governor', 'perf.governor', (ctx: FrameCtx) => {
+      const g = governor()
+      const cas = pointCloudServices()?.cas ?? null
+      g.setCas(cas)
+      g.evaluate(ctx)
+      if (g.labelKey !== perfStore.getState().governorLabelKey) perfStore.setState({ governorStep: g.step, governorLabelKey: g.labelKey })
+      // D2.1 quality profile: the tablet's 30 fps limit once the governor stepped down, and the frame-time target with it
+      if (g.step !== qualityStep) {
+        qualityStep = g.step
+        loop.setQualityFps(qualityFpsNow(be.quality, qualityStep))
+        p.meta.targetMs = targetMsOf(be, refreshMs(), qualityStep)
+        if (be.deviceClass !== 'software') cas?.setTarget?.(p.meta.targetMs, p.meta.tailK)
+      }
+      statsFrom = reportClientStats(stats, statsFrom)
+      // FR-013 start-rung memory: CAS held at the floor > 30 s in this session
+      const st = cas?.state() as { atFloorTotalMs?: number } | undefined
+      if (!floorSaved && st?.atFloorTotalMs !== undefined) {
+        floorTotalMs = st.atFloorTotalMs
+        if (floorTotalMs > PREF_FLOOR_MS && be.deviceClass !== 'software') {
+          floorSaved = true
+          rememberFloorHeld(readCache(be.info.rendererKey), be.info.rendererKey, be.deviceClass, be.tier)
+        }
+      }
+    }, { fps: 1 }),
+  ]
+  const offLost = be.onLost(() => {
+    perfStore.setState({ backendState: 'LOST' })
+    void requestRebuild('webglcontextlost')
+  })
+  // PerfGovernor step 6: motion tier cap (stores/perf.motionCap, M15 ui/motion/tier.ts takes the minimum). Tier S starts
+  // at lite (one level: reduced), Tier B/A at full (lite, then reduced)
+  const motionLevels: readonly (MotionCap | null)[] = be.tier === 'S' ? [null, 'reduced'] : [null, 'lite', 'reduced']
+  // ?chrome=0 (canvas only) has no UI whose motion could change: the step is silent there; with the UI the change shows
+  // only while some UI animation or transition runs (FX2-R3, ADR-067). document.getAnimations() flushes style: called
+  // inside the governor phase right after the motion knob rewrote <html data-motion> it forced a whole-document style
+  // recalculation in the loop callback (47-51 ms, ACC-3 4.2a). The answer is sampled instead in an idle callback after
+  // the frame (style is clean then) and the knob reads the sample, at most 1 s old (P4-WEB, ADR-071 item 5).
+  const withUi = typeof location === 'undefined' || new URLSearchParams(location.search).get('chrome') !== '0'
+  const uiAnim = installAnimationSampler()
+  const animating = (): boolean => uiAnim.animating
+  const offMotion = perf.registerKnob({
+    step: 6, id: 'motion', levels: motionLevels.length, labelKey: 'perf.governor.motion',
+    apply: (l) => perfStore.setState({ motionCap: motionLevels[l] ?? (be.tier === 'S' ? null : 'full') }),
+    visible: () => withUi && animating(),
+  })
+  // layers that register after the zoo (a drone runtime created late, a world switch): their warm-up variants are
+  // rendered once in the next frame's world phase, before the frame's own render overwrites the drawing buffer, so the
+  // buffers, draw states and SwiftShader routines exist before their first visible use (P4-WEB, ADR-071 item 2)
+  // A sync warm-up cannot wait for the microtask in which three's nodes handler drops the geometry it just built, so the
+  // same layers are rendered once more in the following frame (warmup.ts, second pass)
+  let lateIds: Set<LayerId> | null = null
+  let lateAgain: Set<LayerId> | null = null
+  const offLateTask = register('world', 'viewport.lateWarm', () => {
+    if (be.state !== 'READY') return
+    const ids = lateAgain ?? lateIds
+    if (!ids) return
+    if (lateAgain) lateAgain = null
+    else {
+      lateIds = null
+      lateAgain = ids
+    }
+    try {
+      void be.warmup(camera, collectZoo(ids), { sync: true })
+    } catch (e) {
+      console.warn('late layer warm-up failed', e)
+    }
+  }, { order: 1000 })
+  const offLate = onLayersChanged(() => {
+    if (warmedLayers.size === 0) return // the boot zoo has not run yet: it will take them
+    const present = new Set(listLayers().map((l) => l.id))
+    for (const id of [...warmedLayers]) if (!present.has(id)) warmedLayers.delete(id) // unmounted: a remount warms again
+    for (const l of listLayers()) {
+      if (warmedLayers.has(l.id)) continue
+      warmedLayers.add(l.id)
+      ;(lateIds ??= new Set()).add(l.id)
+    }
+  })
+  const offSensorCam = installSensorViewCamera()
+  const offQuality = installQualityMasks(be)
+  const offBench = installBench(be, rig, camera)
+  const offReveal = perf.onReveal(() => vp.changed())
+  vp.changed()
+  return () => {
+    for (const off of offs) off()
+    offLost()
+    offMotion()
+    uiAnim.dispose()
+    offLate()
+    offLateTask()
+    offSensorCam()
+    offQuality()
+    offBench()
+    offReveal()
+    onRefreshChange(null)
+    loop.setQualityFps(0)
+    rig.dispose()
+    if (vp.rig === rig) vp.rig = null
+    vp.picker = null
+  }
+}
